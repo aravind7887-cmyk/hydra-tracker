@@ -140,73 +140,82 @@ export default function App() {
   const [stravaLoading, setStravaLoading] = useState(false);
   const [stravaError, setStravaError] = useState(null);
 
+  // DB ready flag
+  const [dbReady, setDbReady] = useState(false);
+
   // AI Plan
   const [aiPlan, setAiPlan] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState(null);
 
-  // ── Persist log per calendar day ──────────────────────────────────────────
+  // ── Derived values ────────────────────────────────────────────────────────
+  const hevyNum         = parseInt(hevyMins, 10) || 0;
+  const calNum          = parseInt(healthifyCalories, 10) || 0;
+  const totalStravaSecs = stravaActivities.reduce((s, a) => s + a.moving_time, 0);
+  const effectiveWeight = getEffectiveWeight(weightLog);
+  const isWeightAvg     = !weightLog[TODAY_KEY];
+  const goal            = calcGoal(effectiveWeight, totalStravaSecs, weather, hevyNum, calNum);
+  const consumed        = log.reduce((s, e) => s + e.ml, 0);
+  const pct             = goal > 0 ? (consumed / goal) * 100 : 0;
+  const weatherAdj      = WEATHER_OPTIONS.find(w => w.value === weather)?.adj ?? 0;
+
+  // ── Init: migrate localStorage → DB, load from DB, then OAuth/Strava/Hevy ──
   useEffect(() => {
-    // Migration: import old hydra-log → hydra-history once, then delete it
-    try {
-      const oldRaw = localStorage.getItem('hydra-log');
-      if (oldRaw) {
-        const { date, entries } = JSON.parse(oldRaw);
-        const history = JSON.parse(localStorage.getItem('hydra-history') || '{}');
-        if (!history[date]) {
-          history[date] = { entries, goal: 0 };
-          localStorage.setItem('hydra-history', JSON.stringify(history));
-        }
-        localStorage.removeItem('hydra-log');
+    async function init() {
+      // 1. One-time migration from localStorage
+      const lsHistory = localStorage.getItem('hydra-history');
+      const lsWeight  = localStorage.getItem('hydra-weight-log');
+      if (lsHistory || lsWeight) {
+        try {
+          await fetch('/api/hydra/migrate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              hydraHistory: lsHistory ? JSON.parse(lsHistory) : {},
+              weightLog:    lsWeight  ? JSON.parse(lsWeight)  : {},
+            }),
+          });
+          localStorage.removeItem('hydra-history');
+          localStorage.removeItem('hydra-weight-log');
+          localStorage.removeItem('hydra-log');
+        } catch { /* keep localStorage intact, retry next load */ }
       }
-    } catch { /* ignore */ }
 
-    try {
-      const history = JSON.parse(localStorage.getItem('hydra-history') || '{}');
-      setHydraHistory(history);
-      const todayData = history[TODAY_KEY];
-      if (todayData?.entries) setLog(todayData.entries);
-    } catch { /* ignore */ }
-  }, []);
+      // 2. Load from DB
+      try {
+        const [histRes, weightRes] = await Promise.all([
+          fetch('/api/hydra/history'),
+          fetch('/api/hydra/weights'),
+        ]);
+        const history = await histRes.json();
+        const weights = await weightRes.json();
+        setHydraHistory(history);
+        setWeightLog(weights);
+        if (history[TODAY_KEY]?.entries) setLog(history[TODAY_KEY].entries);
+        if (weights[TODAY_KEY]) setWeightInput(String(weights[TODAY_KEY]));
+      } catch { /* silent */ }
 
-  useEffect(() => {
-    try {
-      const history = JSON.parse(localStorage.getItem('hydra-history') || '{}');
-      history[TODAY_KEY] = { entries: log, goal };
-      localStorage.setItem('hydra-history', JSON.stringify(history));
-      setHydraHistory({ ...history });
-    } catch { /* ignore */ }
-  }, [log, goal]);
+      setDbReady(true);
 
-  // ── Persist weight log ────────────────────────────────────────────────────
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem('hydra-weight-log');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        setWeightLog(parsed);
-        const todayVal = parsed[TODAY_KEY];
-        if (todayVal) setWeightInput(String(todayVal));
-      }
-    } catch { /* ignore */ }
-  }, []);
-
-  useEffect(() => {
-    if (Object.keys(weightLog).length > 0) {
-      localStorage.setItem('hydra-weight-log', JSON.stringify(weightLog));
+      // 3. OAuth + Strava + Hevy
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('connected') === 'true') window.history.replaceState({}, '', '/');
+      tryFetchStrava();
+      fetchHevyData();
     }
-  }, [weightLog]);
-
-  // ── On mount: handle OAuth callback + auto-connect ────────────────────────
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('connected') === 'true') {
-      window.history.replaceState({}, '', '/');
-    }
-    tryFetchStrava();
-    fetchHevyData();
+    init();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Sync goal to DB whenever it changes (after init) ─────────────────────
+  useEffect(() => {
+    if (!dbReady) return;
+    fetch('/api/hydra/goal', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date_key: TODAY_KEY, goal }),
+    }).catch(() => {});
+  }, [goal, dbReady]);
 
   // ── Hevy fetch ────────────────────────────────────────────────────────────
   async function fetchHevyData() {
@@ -287,32 +296,46 @@ export default function App() {
     }
   }
 
-  // ── Derived values ────────────────────────────────────────────────────────
-  const hevyNum         = parseInt(hevyMins, 10) || 0;
-  const calNum          = parseInt(healthifyCalories, 10) || 0;
-  const totalStravaSecs = stravaActivities.reduce((s, a) => s + a.moving_time, 0);
-  const effectiveWeight = getEffectiveWeight(weightLog);
-  const isWeightAvg     = !weightLog[TODAY_KEY];
-  const goal            = calcGoal(effectiveWeight, totalStravaSecs, weather, hevyNum, calNum);
-  const consumed        = log.reduce((s, e) => s + e.ml, 0);
-  const pct             = goal > 0 ? (consumed / goal) * 100 : 0;
-  const weatherAdj      = WEATHER_OPTIONS.find(w => w.value === weather)?.adj ?? 0;
-
-  function saveWeight() {
+  async function saveWeight() {
     const val = parseFloat(weightInput);
     if (!val || val <= 0) return;
+    await fetch('/api/hydra/weight', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date_key: TODAY_KEY, weight_kg: val }),
+    }).catch(() => {});
     setWeightLog(prev => ({ ...prev, [TODAY_KEY]: val }));
   }
 
-  function addWater(ml) {
+  async function addWater(ml) {
     const amount = parseInt(ml, 10);
     if (!amount || amount <= 0) return;
-    setLog(prev => [...prev, { ml: amount, time: new Date().toISOString() }]);
+    const entry = { ml: amount, time: new Date().toISOString() };
+    try {
+      const res = await fetch('/api/hydra/water', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date_key: TODAY_KEY, ...entry, goal }),
+      });
+      const { id } = await res.json();
+      const newEntry = { ...entry, id };
+      setLog(prev => [...prev, newEntry]);
+      setHydraHistory(prev => {
+        const today = prev[TODAY_KEY] ?? { entries: [], goal };
+        return { ...prev, [TODAY_KEY]: { entries: [...today.entries, newEntry], goal } };
+      });
+    } catch { /* silent */ }
     setCustomMl('');
   }
 
-  function removeEntry(originalIdx) {
-    setLog(prev => prev.filter((_, i) => i !== originalIdx));
+  async function removeEntry(entryId) {
+    await fetch(`/api/hydra/water/${entryId}`, { method: 'DELETE' }).catch(() => {});
+    setLog(prev => prev.filter(e => e.id !== entryId));
+    setHydraHistory(prev => {
+      const today = prev[TODAY_KEY];
+      if (!today) return prev;
+      return { ...prev, [TODAY_KEY]: { ...today, entries: today.entries.filter(e => e.id !== entryId) } };
+    });
   }
 
   // ── AI Plan ───────────────────────────────────────────────────────────────
@@ -603,12 +626,12 @@ export default function App() {
               ) : (
                 <>
                   {[...log].reverse().map((entry, i) => (
-                    <div key={i} className="log-row">
+                    <div key={entry.id ?? i} className="log-row">
                       <span className="log-time">{fmtTime(entry.time)}</span>
                       <span className="log-ml">+{entry.ml}ml</span>
                       <button
                         className="log-del"
-                        onClick={() => removeEntry(log.length - 1 - i)}
+                        onClick={() => removeEntry(entry.id)}
                         title="Remove"
                       >
                         ✕
