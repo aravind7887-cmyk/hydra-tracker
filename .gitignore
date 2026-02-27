@@ -3,3 +3,4 @@ client/node_modules/
 .env
 tokens.json
 hydra.db
+client/dist/

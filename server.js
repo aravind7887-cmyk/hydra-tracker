@@ -283,4 +283,11 @@ app.post('/api/hydra/migrate', (req, res) => {
   res.json({ ok: true });
 });
 
+// Serve built Vite client
+app.use(express.static(path.join(__dirname, 'client/dist')));
+// SPA fallback
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'client/dist', 'index.html'));
+});
+
 app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
